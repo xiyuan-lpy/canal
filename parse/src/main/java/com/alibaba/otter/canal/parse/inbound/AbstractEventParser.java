@@ -19,11 +19,13 @@ import com.alibaba.otter.canal.common.AbstractCanalLifeCycle;
 import com.alibaba.otter.canal.common.alarm.CanalAlarmHandler;
 import com.alibaba.otter.canal.filter.CanalEventFilter;
 import com.alibaba.otter.canal.parse.CanalEventParser;
+import com.alibaba.otter.canal.parse.driver.mysql.packets.GTIDSet;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.MysqlGTIDSet;
 import com.alibaba.otter.canal.parse.exception.CanalParseException;
 import com.alibaba.otter.canal.parse.exception.PositionNotFoundException;
 import com.alibaba.otter.canal.parse.exception.TableIdNotFoundException;
 import com.alibaba.otter.canal.parse.inbound.EventTransactionBuffer.TransactionFlushCallback;
+import com.alibaba.otter.canal.parse.inbound.mysql.MysqlMultiStageCoprocessor;
 import com.alibaba.otter.canal.parse.index.CanalLogPositionManager;
 import com.alibaba.otter.canal.parse.support.AuthenticationInfo;
 import com.alibaba.otter.canal.protocol.CanalEntry;
@@ -179,6 +181,8 @@ public abstract class AbstractEventParser<EVENT> extends AbstractCanalLifeCycle 
                             serverId = queryServerId;
                         }
                         // 4. 获取最后的位置信息
+                        long start = System.currentTimeMillis();
+                        logger.warn("---> begin to find start position, it will be long time for reset or first position");
                         EntryPosition position = findStartPosition(erosaConnection);
                         final EntryPosition startPosition = position;
                         if (startPosition == null) {
@@ -189,7 +193,10 @@ public abstract class AbstractEventParser<EVENT> extends AbstractCanalLifeCycle 
                             throw new CanalParseException("can't find init table meta for " + destination
                                                           + " with position : " + startPosition);
                         }
-                        logger.warn("find start position : {}", startPosition.toString());
+                        long end = System.currentTimeMillis();
+                        logger.warn("---> find start position successfully, {}", startPosition.toString() + " cost : "
+                                                                                 + (end - start)
+                                                                                 + "ms , the next step is binlog dump");
                         // 重新链接，因为在找position过程中可能有状态，需要断开后重建
                         erosaConnection.reconnect();
 
@@ -235,12 +242,14 @@ public abstract class AbstractEventParser<EVENT> extends AbstractCanalLifeCycle 
                         if (parallel) {
                             // build stage processor
                             multiStageCoprocessor = buildMultiStageCoprocessor();
-                            multiStageCoprocessor.start();
-
                             if (isGTIDMode()) {
                                 // 判断所属instance是否启用GTID模式，是的话调用ErosaConnection中GTID对应方法dump数据
-                                erosaConnection.dump(MysqlGTIDSet.parse(startPosition.getGtid()), multiStageCoprocessor);
+                                GTIDSet gtidSet = MysqlGTIDSet.parse(startPosition.getGtid());
+                                ((MysqlMultiStageCoprocessor) multiStageCoprocessor).setGtidSet(gtidSet);
+                                multiStageCoprocessor.start();
+                                erosaConnection.dump(gtidSet, multiStageCoprocessor);
                             } else {
+                                multiStageCoprocessor.start();
                                 if (StringUtils.isEmpty(startPosition.getJournalName())
                                     && startPosition.getTimestamp() != null) {
                                     erosaConnection.dump(startPosition.getTimestamp(), multiStageCoprocessor);
@@ -313,10 +322,10 @@ public abstract class AbstractEventParser<EVENT> extends AbstractCanalLifeCycle 
                     eventSink.interrupt();
                     transactionBuffer.reset();// 重置一下缓冲队列，重新记录数据
                     binlogParser.reset();// 重新置位
-                    if (multiStageCoprocessor != null) {
+                    if (multiStageCoprocessor != null && multiStageCoprocessor.isStart()) {
                         // 处理 RejectedExecutionException
                         try {
-                            multiStageCoprocessor.reset();
+                            multiStageCoprocessor.stop();
                         } catch (Throwable t) {
                             logger.debug("multi processor rejected:", t);
                         }
@@ -349,7 +358,11 @@ public abstract class AbstractEventParser<EVENT> extends AbstractCanalLifeCycle 
         eventSink.interrupt();
 
         if (multiStageCoprocessor != null && multiStageCoprocessor.isStart()) {
-            multiStageCoprocessor.stop();
+            try {
+                multiStageCoprocessor.stop();
+            } catch (Throwable t) {
+                logger.debug("multi processor rejected:", t);
+            }
         }
 
         try {
